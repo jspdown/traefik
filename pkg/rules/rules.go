@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/gorilla/mux"
+	"github.com/traefik/traefik/v2/pkg/ip"
 	"github.com/traefik/traefik/v2/pkg/log"
 	"github.com/traefik/traefik/v2/pkg/middlewares/requestdecorator"
 	"github.com/vulcand/predicate"
@@ -21,6 +22,7 @@ var funcs = map[string]func(*mux.Route, ...string) error{
 	"Headers":       headers,
 	"HeadersRegexp": headersRegexp,
 	"Query":         query,
+	"OriginCIDR":    originCIDR,
 }
 
 // Router handle routing with rules.
@@ -174,6 +176,19 @@ func query(route *mux.Route, query ...string) error {
 	route.Queries(queries...)
 	// Queries can return nil so we can't chain the GetError()
 	return route.GetError()
+}
+
+func originCIDR(route *mux.Route, sourceRange ...string) error {
+	checker, err := ip.NewChecker(sourceRange)
+	if err != nil {
+		return fmt.Errorf("cannot parse CIDR whitelist %s: %w", sourceRange, err)
+	}
+
+	route.MatcherFunc(func(req *http.Request, _ *mux.RouteMatch) bool {
+		return checker.IsAuthorized(req.RemoteAddr) == nil
+	})
+
+	return nil
 }
 
 func addRuleOnRouter(router *mux.Router, rule *tree) error {

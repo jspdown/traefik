@@ -17,6 +17,7 @@ func Test_addRoute(t *testing.T) {
 		desc          string
 		rule          string
 		headers       map[string]string
+		remoteAddr    string
 		expected      map[string]int
 		expectedError bool
 	}{
@@ -230,6 +231,38 @@ func Test_addRoute(t *testing.T) {
 			},
 		},
 		{
+			desc:       "OriginCIDR with CIDR",
+			rule:       "OriginCIDR(`192.168.10.0/24`)",
+			remoteAddr: "192.168.10.1",
+			expected: map[string]int{
+				"http://localhost/foo": http.StatusOK,
+			},
+		},
+		{
+			desc:       "OriginCIDR with IP out of CIDR",
+			rule:       "OriginCIDR(`192.168.10.0/24`)",
+			remoteAddr: "192.168.11.0",
+			expected: map[string]int{
+				"http://localhost/foo": http.StatusNotFound,
+			},
+		},
+		{
+			desc:       "OriginCIDR with IP",
+			rule:       "OriginCIDR(`192.168.10.0`)",
+			remoteAddr: "192.168.10.0",
+			expected: map[string]int{
+				"http://localhost/foo": http.StatusOK,
+			},
+		},
+		{
+			desc:       "OriginCIDR with non matching IP",
+			rule:       "OriginCIDR(`192.168.10.0`)",
+			remoteAddr: "192.168.10.1",
+			expected: map[string]int{
+				"http://localhost/foo": http.StatusNotFound,
+			},
+		},
+		{
 			desc: "Rule with simple path",
 			rule: `Path("/a")`,
 			expected: map[string]int{
@@ -415,6 +448,16 @@ func Test_addRoute(t *testing.T) {
 			rule:          `Host("tchouk") && Path("", "/titi")`,
 			expectedError: true,
 		},
+		{
+			desc:          "OriginCIDR with invalid CIDR",
+			rule:          "OriginCIDR(`192.168.10.0/64`)",
+			expectedError: true,
+		},
+		{
+			desc:          "OriginCIDR with invalid IP",
+			rule:          "OriginCIDR(`192.168.10`)",
+			expectedError: true,
+		},
 	}
 
 	for _, test := range testCases {
@@ -443,6 +486,7 @@ func Test_addRoute(t *testing.T) {
 					for key, value := range test.headers {
 						req.Header.Set(key, value)
 					}
+					req.RemoteAddr = test.remoteAddr
 					reqHost.ServeHTTP(w, req, router.ServeHTTP)
 					results[calledURL] = w.Code
 				}
