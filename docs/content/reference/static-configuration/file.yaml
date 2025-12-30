@@ -322,6 +322,7 @@ api:
   dashboard: true
   debug: true
   disableDashboardAd: true
+  redact: true
 metrics:
   prometheus:
     buckets:

@@ -51,6 +51,9 @@ Disable ad in the dashboard. (Default: ```false```)
 `--api.insecure`:  
 Activate API directly on the entryPoint named traefik. (Default: ```false```)
 
+`--api.redact`:  
+Redact sensitive data from API responses. (Default: ```true```)
+
 `--certificatesresolvers.<name>`:  
 Certificates resolvers configuration. (Default: ```false```)
 

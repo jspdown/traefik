@@ -132,6 +132,29 @@ api:
 --api.debug=true
 ```
 
+### `redact`
+
+_Optional, Default=true_
+
+Redact sensitive configuration data such as credentials and secrets from API responses.
+
+!!! info
+    This option is enabled by default for security. Disable it only in trusted environments where you need to see full configuration details.
+
+```yaml tab="File (YAML)"
+api:
+  redact: false
+```
+
+```toml tab="File (TOML)"
+[api]
+  redact = false
+```
+
+```bash tab="CLI"
+--api.redact=false
+```
+
 ## Endpoints
 
 All the following endpoints must be accessed with a `GET` HTTP request.
