@@ -9,6 +9,7 @@ import (
 	"github.com/traefik/traefik/v2/pkg/config/runtime"
 	"github.com/traefik/traefik/v2/pkg/config/static"
 	"github.com/traefik/traefik/v2/pkg/metrics"
+	"github.com/traefik/traefik/v2/pkg/redactor"
 	"github.com/traefik/traefik/v2/pkg/safe"
 )
 
@@ -38,7 +39,8 @@ func NewManagerFactory(staticConfiguration static.Configuration, routinesPool *s
 	}
 
 	if staticConfiguration.API != nil {
-		apiRouterBuilder := api.NewBuilder(staticConfiguration)
+		apiRedactor := redactor.NewCredentialRemover()
+		apiRouterBuilder := api.NewBuilder(staticConfiguration, apiRedactor)
 
 		if staticConfiguration.API.Dashboard {
 			factory.dashboardHandler = dashboard.Handler{}

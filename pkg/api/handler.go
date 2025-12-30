@@ -11,6 +11,7 @@ import (
 	"github.com/traefik/traefik/v2/pkg/config/runtime"
 	"github.com/traefik/traefik/v2/pkg/config/static"
 	"github.com/traefik/traefik/v2/pkg/log"
+	"github.com/traefik/traefik/v2/pkg/redactor"
 	"github.com/traefik/traefik/v2/pkg/version"
 )
 
@@ -48,29 +49,43 @@ type RunTimeRepresentation struct {
 // Handler serves the configuration and status of Traefik on API endpoints.
 type Handler struct {
 	staticConfig static.Configuration
+	redactor     *redactor.Redactor
 
 	// runtimeConfiguration is the data set used to create all the data representations exposed by the API.
 	runtimeConfiguration *runtime.Configuration
 }
 
 // NewBuilder returns a http.Handler builder based on runtime.Configuration.
-func NewBuilder(staticConfig static.Configuration) func(*runtime.Configuration) http.Handler {
+func NewBuilder(staticConfig static.Configuration, redactor *redactor.Redactor) func(*runtime.Configuration) http.Handler {
 	return func(configuration *runtime.Configuration) http.Handler {
-		return New(staticConfig, configuration).createRouter()
+		return New(staticConfig, configuration, redactor).createRouter()
 	}
 }
 
 // New returns a Handler defined by staticConfig, and if provided, by runtimeConfig.
 // It finishes populating the information provided in the runtimeConfig.
-func New(staticConfig static.Configuration, runtimeConfig *runtime.Configuration) *Handler {
+func New(staticConfig static.Configuration, runtimeConfig *runtime.Configuration, redactor *redactor.Redactor) *Handler {
 	rConfig := runtimeConfig
 	if rConfig == nil {
 		rConfig = &runtime.Configuration{}
 	}
 
+	if staticConfig.API != nil && staticConfig.API.Redact && redactor != nil {
+		redacted, err := redactor.Redact(rConfig)
+		if err != nil {
+			// If redaction fails, use empty config to avoid exposing sensitive data.
+			log.WithoutContext().Errorf("Failed to redact runtime configuration: %v", err)
+
+			rConfig = &runtime.Configuration{}
+		} else {
+			rConfig = redacted.(*runtime.Configuration)
+		}
+	}
+
 	return &Handler{
 		runtimeConfiguration: rConfig,
 		staticConfig:         staticConfig,
+		redactor:             redactor,
 	}
 }
 
