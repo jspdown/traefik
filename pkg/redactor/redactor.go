@@ -1,7 +1,6 @@
 package redactor
 
 import (
-	"encoding/json"
 	"fmt"
 	"reflect"
 
@@ -18,67 +17,51 @@ const (
 	tagExport   = "export"
 )
 
-// Anonymize redacts the configuration fields that do not have an export=true struct tag.
-// It returns the resulting marshaled configuration.
-func Anonymize(baseConfig interface{}) (string, error) {
-	return anonymize(baseConfig, false)
+// PluginRedactor redacts a plugin.
+type PluginRedactor interface {
+	Redact(typ string, config map[string]any) (map[string]any, error)
 }
 
-func anonymize(baseConfig interface{}, indent bool) (string, error) {
-	conf, err := do(baseConfig, tagExport, true, indent)
-	if err != nil {
-		return "", err
-	}
-	return doOnJSON(conf), nil
+// Redactor anonymizes configuration structures by masking sensitive fields.
+// It uses struct tags to determine which fields should be redacted or preserved.
+type Redactor struct {
+	Tag             string
+	RedactByDefault bool
+	RedactURLs      bool
+	PluginRedactor  PluginRedactor
 }
 
-// RemoveCredentials redacts the configuration fields that have a loggable=false struct tag.
-// It returns the resulting marshaled configuration.
-func RemoveCredentials(baseConfig interface{}) (string, error) {
-	return removeCredentials(baseConfig, false)
+// NewCredentialRemover creates a Redactor that redacts configuration fields with loggable=false struct tag.
+func NewCredentialRemover() *Redactor {
+	return &Redactor{Tag: tagLoggable, PluginRedactor: &defaultPluginRedactor{}}
 }
 
-func removeCredentials(baseConfig interface{}, indent bool) (string, error) {
-	return do(baseConfig, tagLoggable, false, indent)
+// NewAnonymizer creates a Redactor that redacts configuration fields that do not have an export=true struct tag.
+func NewAnonymizer() *Redactor {
+	return &Redactor{Tag: tagExport, RedactByDefault: true, RedactURLs: true, PluginRedactor: &defaultPluginRedactor{}}
 }
 
-// do marshals the given configuration, while redacting some of the fields
-// respectively to the given tag.
-func do(baseConfig interface{}, tag string, redactByDefault, indent bool) (string, error) {
+// Redact redacts sensitive fields.
+// It returns the redacted copy without modifying the original configuration.
+func (r *Redactor) Redact(baseConfig any) (any, error) {
 	anomConfig, err := copystructure.Copy(baseConfig)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	val := reflect.ValueOf(anomConfig)
-
-	err = doOnStruct(val, tag, redactByDefault)
-	if err != nil {
-		return "", err
+	if err = r.doOnStruct(val); err != nil {
+		return nil, err
 	}
 
-	configJSON, err := marshal(anomConfig, indent)
-	if err != nil {
-		return "", err
-	}
-
-	return string(configJSON), nil
+	return anomConfig, nil
 }
 
-func doOnJSON(input string) string {
-	return xurls.Relaxed().ReplaceAllString(input, maskLarge)
-}
-
-func doOnStruct(field reflect.Value, tag string, redactByDefault bool) error {
-	if field.Type().AssignableTo(reflect.TypeOf(dynamic.PluginConf{})) {
-		resetPlugin(field)
-		return nil
-	}
-
+func (r *Redactor) doOnStruct(field reflect.Value) error {
 	switch field.Kind() {
 	case reflect.Ptr:
 		if !field.IsNil() {
-			if err := doOnStruct(field.Elem(), tag, redactByDefault); err != nil {
+			if err := r.doOnStruct(field.Elem()); err != nil {
 				return err
 			}
 		}
@@ -90,7 +73,7 @@ func doOnStruct(field reflect.Value, tag string, redactByDefault bool) error {
 				continue
 			}
 
-			if stField.Tag.Get(tag) == "false" || stField.Tag.Get(tag) != "true" && redactByDefault {
+			if stField.Tag.Get(r.Tag) == "false" || stField.Tag.Get(r.Tag) != "true" && r.RedactByDefault {
 				if err := reset(fld, stField.Name); err != nil {
 					return err
 				}
@@ -102,7 +85,7 @@ func doOnStruct(field reflect.Value, tag string, redactByDefault bool) error {
 				fldPtr := reflect.New(fld.Type())
 				fldPtr.Elem().Set(fld)
 
-				if err := doOnStruct(fldPtr, tag, redactByDefault); err != nil {
+				if err := r.doOnStruct(fldPtr); err != nil {
 					return err
 				}
 
@@ -111,7 +94,7 @@ func doOnStruct(field reflect.Value, tag string, redactByDefault bool) error {
 				continue
 			}
 
-			if err := doOnStruct(fld, tag, redactByDefault); err != nil {
+			if err := r.doOnStruct(fld); err != nil {
 				return err
 			}
 		}
@@ -119,12 +102,24 @@ func doOnStruct(field reflect.Value, tag string, redactByDefault bool) error {
 		for _, key := range field.MapKeys() {
 			val := field.MapIndex(key)
 
-			// A struct value cannot be set it must be filled as pointer.
-			if val.Kind() == reflect.Struct {
+			// If the value in the map is a PluginConf, redacts it. The key is the type of plugin.
+			if val.Type().AssignableTo(reflect.TypeOf(dynamic.PluginConf{})) {
+				redactedPluginConfig, err := r.PluginRedactor.Redact(key.String(), val.Interface().(dynamic.PluginConf))
+				if err != nil {
+					return fmt.Errorf("redacting plugin %s configuration: %w", key.String(), err)
+				}
+
+				field.SetMapIndex(key, reflect.ValueOf(redactedPluginConfig))
+
+				continue
+			}
+
+			// A struct and a string value cannot be set, it must be filled as pointer.
+			if val.Kind() == reflect.Struct || val.Kind() == reflect.String {
 				valPtr := reflect.New(val.Type())
 				valPtr.Elem().Set(val)
 
-				if err := doOnStruct(valPtr, tag, redactByDefault); err != nil {
+				if err := r.doOnStruct(valPtr); err != nil {
 					return err
 				}
 
@@ -133,15 +128,20 @@ func doOnStruct(field reflect.Value, tag string, redactByDefault bool) error {
 				continue
 			}
 
-			if err := doOnStruct(val, tag, redactByDefault); err != nil {
+			if err := r.doOnStruct(val); err != nil {
 				return err
 			}
 		}
 	case reflect.Slice:
 		for j := range field.Len() {
-			if err := doOnStruct(field.Index(j), tag, redactByDefault); err != nil {
+			if err := r.doOnStruct(field.Index(j)); err != nil {
 				return err
 			}
+		}
+	case reflect.String:
+		if field.CanSet() && r.RedactURLs {
+			redacted := xurls.Relaxed().ReplaceAllString(field.String(), maskLarge)
+			field.SetString(redacted)
 		}
 	}
 
@@ -196,13 +196,6 @@ func reset(field reflect.Value, name string) error {
 	return nil
 }
 
-// resetPlugin resets the plugin configuration so it keep the plugin name but not its configuration.
-func resetPlugin(field reflect.Value) {
-	for _, key := range field.MapKeys() {
-		field.SetMapIndex(key, reflect.ValueOf(struct{}{}))
-	}
-}
-
 // isExported return true is a struct field is exported, else false.
 func isExported(f reflect.StructField) bool {
 	if f.PkgPath != "" && !f.Anonymous {
@@ -211,9 +204,13 @@ func isExported(f reflect.StructField) bool {
 	return true
 }
 
-func marshal(anomConfig interface{}, indent bool) ([]byte, error) {
-	if indent {
-		return json.MarshalIndent(anomConfig, "", "  ")
+type defaultPluginRedactor struct{}
+
+func (r *defaultPluginRedactor) Redact(_ string, config map[string]any) (map[string]any, error) {
+	configCopy := make(map[string]any, len(config))
+	for key := range config {
+		configCopy[key] = struct{}{}
 	}
-	return json.Marshal(anomConfig)
+
+	return configCopy, nil
 }

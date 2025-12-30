@@ -6,6 +6,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/traefik/traefik/v2/pkg/config/dynamic"
+	traefiktls "github.com/traefik/traefik/v2/pkg/tls"
 )
 
 type Courgette struct {
@@ -371,8 +373,271 @@ func Test_doOnStruct(t *testing.T) {
 	for _, test := range testCase {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
+
+			anonymizer := &Redactor{
+				Tag:             tagExport,
+				RedactByDefault: test.redactByDefault,
+			}
+
 			val := reflect.ValueOf(test.base).Elem()
-			err := doOnStruct(val, tagExport, test.redactByDefault)
+			err := anonymizer.doOnStruct(val)
+			require.NoError(t, err)
+
+			assert.Equal(t, test.expected, test.base)
+		})
+	}
+}
+
+func Test_defaultPluginRedactor(t *testing.T) {
+	testCases := []struct {
+		name     string
+		input    map[string]any
+		expected map[string]any
+	}{
+		{
+			name:     "empty config",
+			input:    map[string]any{},
+			expected: map[string]any{},
+		},
+		{
+			name: "simple values replaced with empty struct",
+			input: map[string]any{
+				"key1": "value1",
+				"key2": 42,
+			},
+			expected: map[string]any{
+				"key1": struct{}{},
+				"key2": struct{}{},
+			},
+		},
+		{
+			name: "nested values replaced with empty struct",
+			input: map[string]any{
+				"config": map[string]any{
+					"nested": "value",
+				},
+				"list": []string{"a", "b"},
+			},
+			expected: map[string]any{
+				"config": struct{}{},
+				"list":   struct{}{},
+			},
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			redactor := &defaultPluginRedactor{}
+			result, err := redactor.Redact("test-plugin", test.input)
+
+			require.NoError(t, err)
+			assert.Equal(t, test.expected, result)
+		})
+	}
+}
+
+type PluginMiddleware struct {
+	Plugin map[string]dynamic.PluginConf `export:"true"`
+}
+
+func Test_doOnStruct_with_PluginConf(t *testing.T) {
+	testCases := []struct {
+		name     string
+		base     *PluginMiddleware
+		expected *PluginMiddleware
+	}{
+		{
+			name: "plugin config values replaced with empty struct",
+			base: &PluginMiddleware{
+				Plugin: map[string]dynamic.PluginConf{
+					"my-plugin": {
+						"secret": "sensitive-data",
+						"config": map[string]any{
+							"nested": "value",
+						},
+					},
+				},
+			},
+			expected: &PluginMiddleware{
+				Plugin: map[string]dynamic.PluginConf{
+					"my-plugin": {
+						"secret": struct{}{},
+						"config": struct{}{},
+					},
+				},
+			},
+		},
+		{
+			name: "multiple plugins redacted",
+			base: &PluginMiddleware{
+				Plugin: map[string]dynamic.PluginConf{
+					"plugin-a": {
+						"key": "value-a",
+					},
+					"plugin-b": {
+						"key": "value-b",
+					},
+				},
+			},
+			expected: &PluginMiddleware{
+				Plugin: map[string]dynamic.PluginConf{
+					"plugin-a": {
+						"key": struct{}{},
+					},
+					"plugin-b": {
+						"key": struct{}{},
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			anonymizer := &Redactor{
+				Tag:             tagExport,
+				RedactByDefault: true,
+				PluginRedactor:  &defaultPluginRedactor{},
+			}
+
+			val := reflect.ValueOf(test.base).Elem()
+			err := anonymizer.doOnStruct(val)
+			require.NoError(t, err)
+
+			assert.Equal(t, test.expected, test.base)
+		})
+	}
+}
+
+type URLContainer struct {
+	Endpoint string `export:"true"`
+	Domain   string `export:"true"`
+	Plain    string `export:"true"`
+}
+
+type MapURLContainer struct {
+	URLs map[string]string `export:"true"`
+}
+
+type FileOrContentContainer struct {
+	CertFile traefiktls.FileOrContent `export:"true"`
+}
+
+func Test_doOnStruct_RedactURLs(t *testing.T) {
+	testCases := []struct {
+		name       string
+		base       any
+		expected   any
+		redactURLs bool
+	}{
+		{
+			name: "URL in field redacted when RedactURLs is true",
+			base: &URLContainer{
+				Endpoint: "https://example.com/api",
+				Domain:   "sub.domain.com",
+				Plain:    "hello",
+			},
+			expected: &URLContainer{
+				Endpoint: maskLarge,
+				Domain:   maskLarge,
+				Plain:    "hello",
+			},
+			redactURLs: true,
+		},
+		{
+			name: "URL in field preserved when RedactURLs is false",
+			base: &URLContainer{
+				Endpoint: "https://example.com/api",
+				Domain:   "sub.domain.com",
+				Plain:    "hello",
+			},
+			expected: &URLContainer{
+				Endpoint: "https://example.com/api",
+				Domain:   "sub.domain.com",
+				Plain:    "hello",
+			},
+			redactURLs: false,
+		},
+		{
+			name: "email address redacted when RedactURLs is true",
+			base: &URLContainer{
+				Endpoint: "foo@example.com",
+			},
+			expected: &URLContainer{
+				Endpoint: maskLarge,
+			},
+			redactURLs: true,
+		},
+		{
+			name: "mixed content with URLs",
+			base: &URLContainer{
+				Endpoint: "connect to https://api.example.com for more",
+			},
+			expected: &URLContainer{
+				Endpoint: "connect to " + maskLarge + " for more",
+			},
+			redactURLs: true,
+		},
+		{
+			name: "URL in map value redacted when RedactURLs is true",
+			base: &MapURLContainer{
+				URLs: map[string]string{
+					"api":    "https://api.example.com",
+					"static": "https://static.example.com",
+					"plain":  "not-a-url",
+				},
+			},
+			expected: &MapURLContainer{
+				URLs: map[string]string{
+					"api":    maskLarge,
+					"static": maskLarge,
+					"plain":  "not-a-url",
+				},
+			},
+			redactURLs: true,
+		},
+		{
+			name: "URL in map value preserved when RedactURLs is false",
+			base: &MapURLContainer{
+				URLs: map[string]string{
+					"api": "https://api.example.com",
+				},
+			},
+			expected: &MapURLContainer{
+				URLs: map[string]string{
+					"api": "https://api.example.com",
+				},
+			},
+			redactURLs: false,
+		},
+		{
+			name: "URL in FileOrContent field redacted when RedactURLs is true",
+			base: &FileOrContentContainer{
+				CertFile: "https://example.com/cert.pem",
+			},
+			expected: &FileOrContentContainer{
+				CertFile: maskLarge,
+			},
+			redactURLs: true,
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			anonymizer := &Redactor{
+				Tag:             tagExport,
+				RedactByDefault: true,
+				RedactURLs:      test.redactURLs,
+			}
+
+			val := reflect.ValueOf(test.base).Elem()
+			err := anonymizer.doOnStruct(val)
 			require.NoError(t, err)
 
 			assert.Equal(t, test.expected, test.base)

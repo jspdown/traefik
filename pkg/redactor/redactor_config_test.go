@@ -1,6 +1,7 @@
 package redactor
 
 import (
+	"encoding/json"
 	"flag"
 	"os"
 	"strings"
@@ -473,15 +474,25 @@ func TestAnonymize_dynamicConfiguration(t *testing.T) {
 	expectedConfiguration, err := os.ReadFile("./testdata/anonymized-dynamic-config.json")
 	require.NoError(t, err)
 
-	cleanJSON, err := anonymize(config, true)
+	anonymizer := Redactor{
+		Tag:             tagExport,
+		RedactByDefault: true,
+		RedactURLs:      true,
+		PluginRedactor:  &defaultPluginRedactor{},
+	}
+
+	anomConfig, err := anonymizer.Redact(config)
+	require.NoError(t, err)
+
+	cleanJSON, err := json.MarshalIndent(anomConfig, "", "  ")
 	require.NoError(t, err)
 
 	if *updateExpected {
-		require.NoError(t, os.WriteFile("testdata/anonymized-dynamic-config.json", []byte(cleanJSON), 0o666))
+		require.NoError(t, os.WriteFile("testdata/anonymized-dynamic-config.json", cleanJSON, 0o666))
 	}
 
 	expected := strings.TrimSuffix(string(expectedConfiguration), "\n")
-	assert.JSONEq(t, expected, cleanJSON)
+	assert.JSONEq(t, expected, string(cleanJSON))
 }
 
 func TestSecure_dynamicConfiguration(t *testing.T) {
@@ -490,15 +501,24 @@ func TestSecure_dynamicConfiguration(t *testing.T) {
 	expectedConfiguration, err := os.ReadFile("./testdata/secured-dynamic-config.json")
 	require.NoError(t, err)
 
-	cleanJSON, err := removeCredentials(config, true)
+	anonymizer := Redactor{
+		Tag:             tagLoggable,
+		RedactByDefault: false,
+		PluginRedactor:  &defaultPluginRedactor{},
+	}
+
+	anomConfig, err := anonymizer.Redact(config)
+	require.NoError(t, err)
+
+	cleanJSON, err := json.MarshalIndent(anomConfig, "", "  ")
 	require.NoError(t, err)
 
 	if *updateExpected {
-		require.NoError(t, os.WriteFile("testdata/secured-dynamic-config.json", []byte(cleanJSON), 0o666))
+		require.NoError(t, os.WriteFile("testdata/secured-dynamic-config.json", cleanJSON, 0o666))
 	}
 
 	expected := strings.TrimSuffix(string(expectedConfiguration), "\n")
-	assert.JSONEq(t, expected, cleanJSON)
+	assert.JSONEq(t, expected, string(cleanJSON))
 }
 
 func TestDo_staticConfiguration(t *testing.T) {
@@ -982,15 +1002,25 @@ func TestDo_staticConfiguration(t *testing.T) {
 	expectedConfiguration, err := os.ReadFile("./testdata/anonymized-static-config.json")
 	require.NoError(t, err)
 
-	cleanJSON, err := anonymize(config, true)
+	anonymizer := Redactor{
+		Tag:             tagExport,
+		RedactByDefault: true,
+		RedactURLs:      true,
+		PluginRedactor:  &defaultPluginRedactor{},
+	}
+
+	anomConfig, err := anonymizer.Redact(config)
+	require.NoError(t, err)
+
+	cleanJSON, err := json.MarshalIndent(anomConfig, "", "  ")
 	require.NoError(t, err)
 
 	if *updateExpected {
-		require.NoError(t, os.WriteFile("testdata/anonymized-static-config.json", []byte(cleanJSON), 0o666))
+		require.NoError(t, os.WriteFile("testdata/anonymized-static-config.json", cleanJSON, 0o666))
 	}
 
 	expected := strings.TrimSuffix(string(expectedConfiguration), "\n")
-	assert.JSONEq(t, expected, cleanJSON)
+	assert.JSONEq(t, expected, string(cleanJSON))
 }
 
 func pointer[T any](v T) *T { return &v }

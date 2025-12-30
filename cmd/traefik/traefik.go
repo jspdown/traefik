@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	stdlog "log"
 	"net/http"
@@ -105,7 +106,7 @@ func runCmd(staticConfiguration *static.Configuration) error {
 
 	log.WithoutContext().Infof("Traefik version %s built on %s", version.Version, version.BuildDate)
 
-	redactedStaticConfiguration, err := redactor.RemoveCredentials(staticConfiguration)
+	redactedStaticConfiguration, err := redactConfiguration(staticConfiguration)
 	if err != nil {
 		log.WithoutContext().Errorf("Could not redact static configuration: %v", err)
 	} else {
@@ -638,4 +639,18 @@ func collect(staticConfiguration *static.Configuration) {
 			}
 		}
 	})
+}
+
+func redactConfiguration(config any) (string, error) {
+	redacted, err := redactor.NewCredentialRemover().Redact(config)
+	if err != nil {
+		return "", fmt.Errorf("removing credentials: %w", err)
+	}
+
+	data, err := json.Marshal(redacted)
+	if err != nil {
+		return "", fmt.Errorf("marhsalling: %w", err)
+	}
+
+	return string(data), nil
 }

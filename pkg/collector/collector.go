@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"strconv"
@@ -44,7 +45,7 @@ func Collect(staticConfiguration *static.Configuration) error {
 }
 
 func createBody(staticConfiguration *static.Configuration) (*bytes.Buffer, error) {
-	anonConfig, err := redactor.Anonymize(staticConfiguration)
+	anonConfig, err := redactConfiguration(staticConfiguration)
 	if err != nil {
 		return nil, err
 	}
@@ -61,7 +62,7 @@ func createBody(staticConfiguration *static.Configuration) (*bytes.Buffer, error
 		Codename:      version.Codename,
 		BuildDate:     version.BuildDate,
 		Hash:          strconv.FormatUint(hashConf, 10),
-		Configuration: base64.StdEncoding.EncodeToString([]byte(anonConfig)),
+		Configuration: base64.StdEncoding.EncodeToString(anonConfig),
 	}
 
 	buf := new(bytes.Buffer)
@@ -71,6 +72,20 @@ func createBody(staticConfiguration *static.Configuration) (*bytes.Buffer, error
 	}
 
 	return buf, err
+}
+
+func redactConfiguration(config any) ([]byte, error) {
+	redactedConfig, err := redactor.NewAnonymizer().Redact(config)
+	if err != nil {
+		return nil, fmt.Errorf("anonymizing: %w", err)
+	}
+
+	marshaledRedactedConfig, err := json.Marshal(redactedConfig)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling: %w", err)
+	}
+
+	return marshaledRedactedConfig, nil
 }
 
 func makeHTTPClient() *http.Client {

@@ -2,6 +2,8 @@ package aggregator
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/traefik/traefik/v2/pkg/config/dynamic"
@@ -198,16 +200,31 @@ func (p *ProviderAggregator) Provide(configurationChan chan<- dynamic.Message, p
 }
 
 func (p *ProviderAggregator) launchProvider(configurationChan chan<- dynamic.Message, pool *safe.Pool, prd provider.Provider) {
-	jsonConf, err := redactor.RemoveCredentials(prd)
+	log.WithoutContext().Infof("Starting provider %T", prd)
+
+	jsonConf, err := redactConfiguration(prd)
 	if err != nil {
 		log.WithoutContext().Debugf("Cannot marshal the provider configuration %T: %v", prd, err)
+	} else {
+		log.WithoutContext().Debugf("%T provider configuration: %s", prd, jsonConf)
 	}
-
-	log.WithoutContext().Infof("Starting provider %T", prd)
-	log.WithoutContext().Debugf("%T provider configuration: %s", prd, jsonConf)
 
 	if err := maybeThrottledProvide(prd, p.providersThrottleDuration)(configurationChan, pool); err != nil {
 		log.WithoutContext().Errorf("Cannot start the provider %T: %v", prd, err)
 		return
 	}
+}
+
+func redactConfiguration(config any) (string, error) {
+	redacted, err := redactor.NewCredentialRemover().Redact(config)
+	if err != nil {
+		return "", fmt.Errorf("removing credentials: %w", err)
+	}
+
+	data, err := json.Marshal(redacted)
+	if err != nil {
+		return "", fmt.Errorf("marhsalling: %w", err)
+	}
+
+	return string(data), nil
 }
