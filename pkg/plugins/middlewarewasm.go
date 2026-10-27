@@ -24,10 +24,6 @@ import (
 
 const typeNameWasm = "wasm"
 
-// maxIdleInstances bounds the component instances a middleware keeps between
-// requests. An instance serves one request at a time.
-const maxIdleInstances = 64
-
 type wasmMiddlewareBuilder struct {
 	code     []byte
 	settings Settings
@@ -65,7 +61,7 @@ func newWasmMiddlewareBuilderFromCode(code []byte, settings Settings) (*wasmMidd
 	if err != nil {
 		return nil, fmt.Errorf("compiling guest component: %w", err)
 	}
-	inst.close(ctx)
+	inst.close()
 
 	return b, nil
 }
@@ -199,7 +195,9 @@ func (b *wasmMiddlewareBuilder) instantiate(ctx context.Context, config map[stri
 		return nil, fmt.Errorf("the Wasm component does not export %s", ifaceHTTPHandler)
 	}
 
-	return &pluginInstance{inst: inst, host: host, export: export}, nil
+	host.loop = component.NewLoop(inst)
+
+	return &pluginInstance{inst: inst, host: host, loop: host.loop, export: export}, nil
 }
 
 func handleExport(inst *component.Instance) (string, bool) {
@@ -259,27 +257,34 @@ type WasmMiddleware struct {
 
 // NewHandler creates a new HTTP handler.
 func (m WasmMiddleware) NewHandler(ctx context.Context, next http.Handler) (http.Handler, error) {
-	h := &wasmHandler{
-		next:    next,
-		builder: m.builder,
-		config:  m.config,
-		logger:  middlewares.GetLogger(ctx, m.middlewareName, typeNameWasm),
-	}
+	logger := middlewares.GetLogger(ctx, m.middlewareName, typeNameWasm)
 
-	inst, err := m.builder.instantiate(ctx, m.config)
-	if err != nil {
-		return nil, fmt.Errorf("building Wasm middleware: %w", err)
-	}
-	h.put(inst)
+	return wrapExternal(next, func(next http.Handler) (http.Handler, error) {
+		inst, err := m.builder.instantiate(ctx, m.config)
+		if err != nil {
+			return nil, fmt.Errorf("building Wasm middleware: %w", err)
+		}
 
-	// Traefik does not close the handlers of a previous configuration: release
-	// the instances once nothing references the handler anymore.
-	// Reference: https://github.com/traefik/traefik/issues/11119
-	runtime.SetFinalizer(h, func(h *wasmHandler) { h.close() })
+		h := &wasmHandler{
+			next:    next,
+			builder: m.builder,
+			config:  m.config,
+			logger:  logger,
+			inst:    inst,
+		}
 
-	return h, nil
+		// Traefik does not close the handlers of a previous configuration:
+		// release the instance once nothing references the handler anymore.
+		// Reference: https://github.com/traefik/traefik/issues/11119
+		runtime.SetFinalizer(h, func(h *wasmHandler) { h.close() })
+
+		return h, nil
+	})
 }
 
+// wasmHandler runs every request through one component instance, each request
+// an async call of its handle export: a plugin costs one linear memory, not
+// one per request in flight.
 type wasmHandler struct {
 	next    http.Handler
 	builder *wasmMiddlewareBuilder
@@ -287,11 +292,11 @@ type wasmHandler struct {
 	logger  *zerolog.Logger
 
 	mu   sync.Mutex
-	idle []*pluginInstance
+	inst *pluginInstance
 }
 
 func (h *wasmHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	inst, err := h.get(req.Context())
+	inst, err := h.instance(req.Context())
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Unable to instantiate the Wasm plugin")
 		http.Error(rw, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -299,62 +304,65 @@ func (h *wasmHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if inst.serve(h.logger, h.next, rw, req) {
-		h.put(inst)
-		return
-	}
+	inst.serve(h.logger, h.next, rw, req)
 
-	inst.close(context.Background())
+	// The finalizer closes the instance: h must stay reachable while a
+	// request uses it, also when the router holding it was replaced.
+	runtime.KeepAlive(h)
 }
 
-func (h *wasmHandler) get(ctx context.Context) (*pluginInstance, error) {
-	h.mu.Lock()
-	if n := len(h.idle); n > 0 {
-		inst := h.idle[n-1]
-		h.idle = h.idle[:n-1]
-		h.mu.Unlock()
-
-		return inst, nil
-	}
-	h.mu.Unlock()
-
-	return h.builder.instantiate(ctx, h.config)
-}
-
-func (h *wasmHandler) put(inst *pluginInstance) {
+// instance returns the instance that serves the requests. A trap poisons an
+// instance for every request, so the first request after it gets a new one.
+func (h *wasmHandler) instance(ctx context.Context) (*pluginInstance, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	if len(h.idle) >= maxIdleInstances {
-		inst.close(context.Background())
-		return
+	if h.inst != nil {
+		select {
+		case <-h.inst.loop.Done():
+			h.logger.Error().Err(h.inst.loop.Err()).Msg("Wasm plugin instance stopped, starting a new one")
+			h.inst.close()
+			h.inst = nil
+		default:
+			return h.inst, nil
+		}
 	}
 
-	h.idle = append(h.idle, inst)
+	// The instance outlives the request that starts it.
+	inst, err := h.builder.instantiate(context.WithoutCancel(ctx), h.config)
+	if err != nil {
+		return nil, err
+	}
+	h.inst = inst
+
+	return inst, nil
 }
 
 func (h *wasmHandler) close() {
 	h.mu.Lock()
-	idle := h.idle
-	h.idle = nil
+	inst := h.inst
+	h.inst = nil
 	h.mu.Unlock()
 
-	for _, inst := range idle {
-		inst.close(context.Background())
+	if inst != nil {
+		inst.close()
 	}
 
 	h.logger.Debug().Msg("Wasm middleware closed")
 }
 
-// pluginInstance is one component instance and its host state.
+// pluginInstance is one component instance, its host state, and the loop that
+// drives it.
 type pluginInstance struct {
 	inst   *component.Instance
 	host   *pluginHost
+	loop   *component.Loop
 	export string
 }
 
-func (p *pluginInstance) close(ctx context.Context) {
-	_ = p.inst.Close(ctx)
+func (p *pluginInstance) close() {
+	p.loop.Close()
+	_ = p.inst.Close(context.Background())
 }
 
 type returnedResponse struct {
@@ -362,55 +370,46 @@ type returnedResponse struct {
 	err  error
 }
 
-// serve runs one request through the plugin. It reports whether the instance
-// can serve another request.
-func (p *pluginInstance) serve(logger *zerolog.Logger, next http.Handler, rw http.ResponseWriter, req *http.Request) bool {
-	ctx := req.Context()
+// serve runs one request through the plugin.
+func (p *pluginInstance) serve(logger *zerolog.Logger, next http.Handler, rw http.ResponseWriter, req *http.Request) {
 	host := p.host
-
-	resolver := &asyncResolver{}
-	host.call = &wasmCall{
-		ctx:      ctx,
-		incoming: req,
-		next:     next,
-		logger:   logger,
-		resolver: resolver,
-		cleanups: []func(){resolver.close},
-	}
-
-	handle := host.resources.NewOwn(tagRequest, host.add(newIncomingRequest(req)))
+	call := newWasmCall(req, next, logger)
 
 	returned := make(chan returnedResponse, 1)
-	onReturn := func(result []component.Value) {
-		resp, err := host.takeResponse(result[0])
-		if err != nil {
-			returned <- returnedResponse{err: err}
-			return
+	done := make(chan error, 1)
+
+	posted := p.loop.Post(func() {
+		handle := host.resources.NewOwn(tagRequest, host.add(call.ctx, newIncomingRequest(req)))
+
+		onReturn := func(result []component.Value) {
+			resp, err := host.takeResponse(result[0])
+			if err == nil {
+				host.streamResponseBody(call, resp.body)
+			}
+
+			returned <- returnedResponse{resp: resp, err: err}
 		}
 
-		start := host.streamResponseBody(resp.body)
-		returned <- returnedResponse{resp: resp}
-		start()
+		if err := p.loop.Start(call.ctx, p.export, onReturn, func(err error) { done <- err }, handle); err != nil {
+			done <- err
+		}
+	})
+	if !posted {
+		logger.Error().Err(p.loop.Err()).Msg("Wasm plugin instance stopped")
+		http.Error(rw, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+
+		return
 	}
 
-	// The instance runs on its own goroutine: after the plugin returned the
-	// response, it continues to run, to write the body this goroutine copies.
-	done := make(chan struct{})
-	var pending *component.PendingCall
-	var callErr error
-	go func() {
-		defer close(done)
-
-		pending, callErr = p.inst.CallAsyncOnReturn(ctx, p.export, onReturn, handle)
-		if callErr == nil {
-			_, callErr = pending.Await(ctx)
-		}
-	}()
-
 	var res returnedResponse
+	var callErr error
+	finished := false
+
 	select {
 	case res = <-returned:
-	case <-done:
+	case callErr = <-done:
+		finished = true
+
 		select {
 		case res = <-returned:
 		default:
@@ -419,12 +418,13 @@ func (p *pluginInstance) serve(logger *zerolog.Logger, next http.Handler, rw htt
 				res.err = errors.New("the plugin did not return a response")
 			}
 		}
+	case <-p.loop.Done():
+		finished = true
+		res.err = p.loop.Err()
 	}
 
-	err := res.err
-
-	if err != nil {
-		logger.Error().Err(err).Msg("Wasm plugin failed")
+	if res.err != nil {
+		logger.Error().Err(res.err).Msg("Wasm plugin failed")
 		http.Error(rw, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 	} else {
 		writeResponse(logger, rw, res.resp)
@@ -435,21 +435,24 @@ func (p *pluginInstance) serve(logger *zerolog.Logger, next http.Handler, rw htt
 		_ = res.resp.body.reader.Close()
 	}
 
-	<-done
-	if callErr != nil {
-		logger.Debug().Err(callErr).Msg("Wasm plugin call did not complete")
-		if pending != nil {
-			_ = pending.Cancel(context.Background())
+	if !finished {
+		// Once the client is gone, the cleanups below make the plugin give
+		// up instead.
+		select {
+		case callErr = <-done:
+		case <-p.loop.Done():
+			callErr = p.loop.Err()
+		case <-req.Context().Done():
+			callErr = req.Context().Err()
 		}
 	}
 
-	for _, cleanup := range slices.Backward(host.call.cleanups) {
-		cleanup()
+	if callErr != nil {
+		logger.Debug().Err(callErr).Msg("Wasm plugin call did not complete")
 	}
-	host.call = nil
-	clear(host.objects)
 
-	return err == nil && callErr == nil
+	call.release()
+	p.loop.Post(func() { host.endCall(call) })
 }
 
 // writeResponse sends the response the plugin returned to the client.

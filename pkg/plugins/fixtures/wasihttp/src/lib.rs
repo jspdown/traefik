@@ -1,6 +1,7 @@
 //! A `traefik:plugin/middleware` component for the Traefik plugin tests.
 //!
-//! The `mode` configuration option selects the behavior under test.
+//! The `mode` configuration option selects the behavior under test. An
+//! `X-Plugin-Mode` request header selects it for one request.
 
 use exports::wasi::http::handler::Guest;
 use wasi::cli::stdout;
@@ -22,7 +23,17 @@ export!(Plugin);
 
 impl Guest for Plugin {
     async fn handle(request: Request) -> Result<Response, ErrorCode> {
-        match config("mode").as_deref() {
+        let mode = request
+            .get_headers()
+            .get("x-plugin-mode")
+            .into_iter()
+            .next()
+            .and_then(|value| String::from_utf8(value).ok())
+            .or_else(|| config("mode"));
+
+        match mode.as_deref() {
+            // Traps, which poisons the instance.
+            Some("panic") => panic!("panic mode"),
             // Answers with the content of the `file` option and the values of
             // the environment variables in the `envs` option.
             Some("respond") => respond(),

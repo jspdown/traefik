@@ -128,28 +128,31 @@ func insecureSeed(context.Context, []component.Value) ([]component.Value, error)
 
 // waitUntil and waitFor resolve from a timer goroutine, once the import call
 // returned (see handle).
-func (h *pluginHost) waitUntil(_ context.Context, args []component.Value, call *component.AsyncCall) error {
+func (h *pluginHost) waitUntil(ctx context.Context, args []component.Value, asyncCall *component.AsyncCall) error {
 	when, _ := args[0].(uint64)
 	d := time.Duration(when) - time.Since(monotonicStart)
 
-	call.Defer(func() { h.resolveAfter(call, d) })
+	asyncCall.Defer(func() { resolveAfter(callFrom(ctx), asyncCall, d) })
 
 	return nil
 }
 
-func (h *pluginHost) waitFor(_ context.Context, args []component.Value, call *component.AsyncCall) error {
+func (h *pluginHost) waitFor(ctx context.Context, args []component.Value, asyncCall *component.AsyncCall) error {
 	d, _ := args[0].(uint64)
 
-	call.Defer(func() { h.resolveAfter(call, time.Duration(d)) })
+	asyncCall.Defer(func() { resolveAfter(callFrom(ctx), asyncCall, time.Duration(d)) })
 
 	return nil
 }
 
-func (h *pluginHost) resolveAfter(call *component.AsyncCall, d time.Duration) {
-	resolver := h.call.resolver
-	timer := time.AfterFunc(max(d, 0), func() { resolver.resolve(call, nil) })
+func resolveAfter(call *wasmCall, asyncCall *component.AsyncCall, d time.Duration) {
+	resolver := &asyncResolver{}
+	if call != nil {
+		resolver = call.resolver
+	}
 
-	h.call.cleanups = append(h.call.cleanups, func() { timer.Stop() })
+	timer := time.AfterFunc(max(d, 0), func() { resolver.resolve(asyncCall, nil) })
+	call.onRelease(func() { timer.Stop() })
 }
 
 // asyncResolver resolves the async import calls of one request from
@@ -214,19 +217,20 @@ func (h *pluginHost) writeViaStream(w io.Writer) component.HostFunc {
 			return nil, err
 		}
 
-		drainer := &streamDrainer{
-			reader: stream,
-			dst:    w,
-			done: func(err error) {
+		body := newStreamBody(h.loop, stream, nil, h.readTrailers, func(error) {})
+
+		go func() {
+			_, err := io.Copy(w, body)
+
+			h.loop.Post(func() {
 				v := result(nil, nil)
 				if err != nil {
 					v = result(nil, uint32(cliErrorIO))
 				}
 
 				done.Set(v, closeFuture(done))
-			},
-		}
-		drainer.run()
+			})
+		}()
 
 		return []component.Value{doneValue}, nil
 	}

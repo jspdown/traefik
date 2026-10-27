@@ -1,6 +1,7 @@
 package plugins
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/samyfodil/wazy/component"
@@ -309,6 +311,78 @@ func TestWasmMiddleware_concurrentRequests(t *testing.T) {
 		})
 	}
 	wg.Wait()
+}
+
+func TestWasmMiddleware_requestsInFlightOnOneInstance(t *testing.T) {
+	const n = 32
+
+	var arrived sync.WaitGroup
+	arrived.Add(n)
+	release := make(chan struct{})
+
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		arrived.Done()
+		<-release
+
+		_, _ = io.Copy(rw, req.Body)
+	})
+	handler := newTestWasmHandler(t, Settings{}, map[string]any{"mode": "uppercase"}, next)
+
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Go(func() {
+			body := fmt.Sprintf("request %d", i)
+
+			rw := httptest.NewRecorder()
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/", strings.NewReader(body))
+
+			handler.ServeHTTP(rw, req)
+
+			assert.Equal(t, http.StatusOK, rw.Code)
+			assert.Equal(t, strings.ToUpper(body), rw.Body.String())
+		})
+	}
+
+	// Every request waits in the next handler at the same time: the one
+	// instance of the middleware has them all in flight.
+	allArrived := make(chan struct{})
+	go func() {
+		arrived.Wait()
+		close(allArrived)
+	}()
+
+	select {
+	case <-allArrived:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the requests did not reach the next handler at the same time")
+	}
+
+	close(release)
+	wg.Wait()
+}
+
+func TestWasmMiddleware_trap(t *testing.T) {
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		_, _ = rw.Write([]byte("next"))
+	})
+	handler := newTestWasmHandler(t, Settings{}, map[string]any{"mode": "next"}, next)
+
+	rw := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", http.NoBody)
+	req.Header.Set("X-Plugin-Mode", "panic")
+
+	handler.ServeHTTP(rw, req)
+
+	assert.Equal(t, http.StatusInternalServerError, rw.Code)
+
+	// The trap poisoned the instance: the next request gets a new one.
+	rw = httptest.NewRecorder()
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", http.NoBody)
+
+	handler.ServeHTTP(rw, req)
+
+	assert.Equal(t, http.StatusOK, rw.Code)
+	assert.Equal(t, "next", rw.Body.String())
 }
 
 func TestCheckPluginComponent(t *testing.T) {

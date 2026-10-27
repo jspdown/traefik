@@ -43,6 +43,8 @@ A Traefik WASM plugin is a [WebAssembly component](https://component-model.bytec
 
 Traefik calls the exported `wasi:http/handler` interface for each request. The plugin forwards a request to the next handler of the router with the imported `wasi:http/handler` interface, or answers the request itself. Requests, responses and their bodies are WASI 0.3 resources and streams, so a plugin can change a body while it flows.
 
+Traefik runs one instance of the plugin for each middleware. The instance serves all the requests of the middleware at the same time, as concurrent async calls of its `handle` export, which WASI 0.3 permits. Keep the state of a request out of global variables. A plugin that cannot serve concurrent requests can refuse them with the backpressure of the component model.
+
 The plugin reads its routing configuration through the `wasi:config/store` interface. Each top-level option of the middleware configuration is one key. A string value is given as is, and any other value is JSON encoded.
 
 The plugin targets the `traefik:plugin/middleware` world:

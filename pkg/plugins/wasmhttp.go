@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/rs/zerolog"
 	"github.com/samyfodil/wazy/component"
@@ -21,13 +22,16 @@ import (
 // component runs against: the wasi:http/types resources, and the imported
 // wasi:http/handler that forwards a request to the next handler.
 //
-// Every function here runs on the goroutine that drives the component
-// instance. The exception is the next handler and what it writes: they run on
-// their own goroutine, and give their results through AsyncCall.Resolve.
+// One instance serves every request of a middleware at the same time, each
+// request an async call of the handle export. Every function here runs on the
+// goroutine of the instance loop. The exception is the network I/O: the next
+// handler, the body pumps and the timers run on goroutines of their own, and
+// give their results to the loop through Loop.Post or AsyncCall.Resolve.
 
 // pluginHost holds the host state of one component instance.
 type pluginHost struct {
 	inst      *component.Instance
+	loop      *component.Loop
 	resources *component.HandleTable
 	config    map[string]string
 
@@ -40,29 +44,101 @@ type pluginHost struct {
 
 	nextRep uint32
 	objects map[uint32]any
-
-	// call is the current request, nil between requests.
-	call *wasmCall
 }
 
-// wasmCall is the state of one request through the plugin.
+// wasmCall is the state of one request through the plugin. The host imports
+// the request's call makes find it in their context.
 type wasmCall struct {
+	// ctx is the request context, with the call in it.
 	ctx      context.Context
 	incoming *http.Request
 	next     http.Handler
 	logger   *zerolog.Logger
 	resolver *asyncResolver
 
-	// cleanups release what the request leaves behind: the bodies nobody
-	// read to the end, so that whatever writes them returns.
+	// Loop only. reps are the host resources the request created, and
+	// cleanups release what it leaves behind: the bodies nobody read to the
+	// end, so that whatever writes them returns.
+	reps     []uint32
 	cleanups []func()
+
+	// releases unblock, from any goroutine, what waits outside the loop once
+	// the request ends.
+	mu       sync.Mutex
+	releases []func()
 }
 
-func (h *pluginHost) add(obj any) uint32 {
+type callKey struct{}
+
+func newWasmCall(req *http.Request, next http.Handler, logger *zerolog.Logger) *wasmCall {
+	call := &wasmCall{
+		incoming: req,
+		next:     next,
+		logger:   logger,
+		resolver: &asyncResolver{},
+	}
+	call.ctx = context.WithValue(req.Context(), callKey{}, call)
+	call.onRelease(call.resolver.close)
+
+	return call
+}
+
+// callFrom returns the request whose call made a host import, or nil outside
+// any request, as during the start of the instance.
+func callFrom(ctx context.Context) *wasmCall {
+	call, _ := ctx.Value(callKey{}).(*wasmCall)
+	return call
+}
+
+func (c *wasmCall) onCleanup(fn func()) {
+	if c != nil {
+		c.cleanups = append(c.cleanups, fn)
+	}
+}
+
+func (c *wasmCall) onRelease(fn func()) {
+	if c == nil {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.releases = append(c.releases, fn)
+}
+
+func (c *wasmCall) release() {
+	c.mu.Lock()
+	releases := c.releases
+	c.releases = nil
+	c.mu.Unlock()
+
+	for _, fn := range releases {
+		fn()
+	}
+}
+
+// add registers a host resource, released with the request that created it.
+func (h *pluginHost) add(ctx context.Context, obj any) uint32 {
 	h.nextRep++
 	h.objects[h.nextRep] = obj
 
+	if call := callFrom(ctx); call != nil {
+		call.reps = append(call.reps, h.nextRep)
+	}
+
 	return h.nextRep
+}
+
+// endCall releases what the request left behind, on the loop.
+func (h *pluginHost) endCall(call *wasmCall) {
+	for _, cleanup := range slices.Backward(call.cleanups) {
+		cleanup()
+	}
+
+	for _, rep := range call.reps {
+		_ = h.dropObject(call.ctx, rep)
+	}
 }
 
 func (h *pluginHost) remove(rep uint32) any {
@@ -336,11 +412,11 @@ func (h *pluginHost) options() ([]component.Option, error) {
 	return opts, nil
 }
 
-func (h *pluginHost) fieldsNew(_ context.Context, _ []component.Value) ([]component.Value, error) {
-	return []component.Value{h.add(&httpFields{})}, nil
+func (h *pluginHost) fieldsNew(ctx context.Context, _ []component.Value) ([]component.Value, error) {
+	return []component.Value{h.add(ctx, &httpFields{})}, nil
 }
 
-func (h *pluginHost) fieldsFromList(_ context.Context, args []component.Value) ([]component.Value, error) {
+func (h *pluginHost) fieldsFromList(ctx context.Context, args []component.Value) ([]component.Value, error) {
 	entries, _ := args[0].([]component.Value)
 
 	f := &httpFields{}
@@ -363,7 +439,7 @@ func (h *pluginHost) fieldsFromList(_ context.Context, args []component.Value) (
 		f.entries = append(f.entries, fieldEntry{name: name, value: value})
 	}
 
-	return results(component.OwnedRep(h.add(f)), nil), nil
+	return results(component.OwnedRep(h.add(ctx, f)), nil), nil
 }
 
 func (h *pluginHost) fieldsGet(_ context.Context, args []component.Value) ([]component.Value, error) {
@@ -495,16 +571,16 @@ func (h *pluginHost) fieldsCopyAll(_ context.Context, args []component.Value) ([
 	return []component.Value{out}, nil
 }
 
-func (h *pluginHost) fieldsClone(_ context.Context, args []component.Value) ([]component.Value, error) {
+func (h *pluginHost) fieldsClone(ctx context.Context, args []component.Value) ([]component.Value, error) {
 	f, err := getObject[*httpFields](h, args[0].(uint32))
 	if err != nil {
 		return nil, err
 	}
 
-	return []component.Value{h.add(f.clone())}, nil
+	return []component.Value{h.add(ctx, f.clone())}, nil
 }
 
-func (h *pluginHost) requestNew(_ context.Context, args []component.Value) ([]component.Value, error) {
+func (h *pluginHost) requestNew(ctx context.Context, args []component.Value) ([]component.Value, error) {
 	headers, err := takeObject[*httpFields](h, args[0].(uint32))
 	if err != nil {
 		return nil, fmt.Errorf("request.new: headers: %w", err)
@@ -535,7 +611,7 @@ func (h *pluginHost) requestNew(_ context.Context, args []component.Value) ([]co
 	}
 	req.transmitted = transmitted
 
-	return []component.Value{[]component.Value{component.OwnedRep(h.add(req)), transmittedValue}}, nil
+	return []component.Value{[]component.Value{component.OwnedRep(h.add(ctx, req)), transmittedValue}}, nil
 }
 
 // guestBody is the body a guest hands over to request.new or response.new.
@@ -701,7 +777,7 @@ func (h *pluginHost) requestSetAuthority(_ context.Context, args []component.Val
 	return results(nil, nil), nil
 }
 
-func (h *pluginHost) requestGetOptions(_ context.Context, args []component.Value) ([]component.Value, error) {
+func (h *pluginHost) requestGetOptions(ctx context.Context, args []component.Value) ([]component.Value, error) {
 	req, err := getObject[*httpRequest](h, args[0].(uint32))
 	if err != nil {
 		return nil, err
@@ -714,29 +790,29 @@ func (h *pluginHost) requestGetOptions(_ context.Context, args []component.Value
 	options := *req.options
 	options.immutable = true
 
-	return []component.Value{component.OwnedRep(h.add(&options))}, nil
+	return []component.Value{component.OwnedRep(h.add(ctx, &options))}, nil
 }
 
-func (h *pluginHost) requestGetHeaders(_ context.Context, args []component.Value) ([]component.Value, error) {
+func (h *pluginHost) requestGetHeaders(ctx context.Context, args []component.Value) ([]component.Value, error) {
 	req, err := getObject[*httpRequest](h, args[0].(uint32))
 	if err != nil {
 		return nil, err
 	}
 
-	return []component.Value{h.add(&httpFields{entries: req.headers.entries, immutable: true})}, nil
+	return []component.Value{h.add(ctx, &httpFields{entries: req.headers.entries, immutable: true})}, nil
 }
 
-func (h *pluginHost) requestConsumeBody(_ context.Context, args []component.Value) ([]component.Value, error) {
+func (h *pluginHost) requestConsumeBody(ctx context.Context, args []component.Value) ([]component.Value, error) {
 	req, err := takeObject[*httpRequest](h, args[0].(uint32))
 	if err != nil {
 		return nil, fmt.Errorf("request.consume-body: %w", err)
 	}
 
-	return h.consumeBody(req.body, args[1])
+	return h.consumeBody(ctx, req.body, args[1])
 }
 
-func (h *pluginHost) optionsNew(_ context.Context, _ []component.Value) ([]component.Value, error) {
-	return []component.Value{h.add(&requestOptions{})}, nil
+func (h *pluginHost) optionsNew(ctx context.Context, _ []component.Value) ([]component.Value, error) {
+	return []component.Value{h.add(ctx, &requestOptions{})}, nil
 }
 
 func optionsGetter(h *pluginHost, field func(*requestOptions) **uint64) component.HostFunc {
@@ -774,7 +850,7 @@ func optionsSetter(h *pluginHost, field func(*requestOptions) **uint64) componen
 	}
 }
 
-func (h *pluginHost) optionsClone(_ context.Context, args []component.Value) ([]component.Value, error) {
+func (h *pluginHost) optionsClone(ctx context.Context, args []component.Value) ([]component.Value, error) {
 	options, err := getObject[*requestOptions](h, args[0].(uint32))
 	if err != nil {
 		return nil, err
@@ -783,10 +859,10 @@ func (h *pluginHost) optionsClone(_ context.Context, args []component.Value) ([]
 	clone := *options
 	clone.immutable = false
 
-	return []component.Value{h.add(&clone)}, nil
+	return []component.Value{h.add(ctx, &clone)}, nil
 }
 
-func (h *pluginHost) responseNew(_ context.Context, args []component.Value) ([]component.Value, error) {
+func (h *pluginHost) responseNew(ctx context.Context, args []component.Value) ([]component.Value, error) {
 	headers, err := takeObject[*httpFields](h, args[0].(uint32))
 	if err != nil {
 		return nil, fmt.Errorf("response.new: headers: %w", err)
@@ -805,7 +881,7 @@ func (h *pluginHost) responseNew(_ context.Context, args []component.Value) ([]c
 	}
 	resp.transmitted = transmitted
 
-	return []component.Value{[]component.Value{component.OwnedRep(h.add(resp)), transmittedValue}}, nil
+	return []component.Value{[]component.Value{component.OwnedRep(h.add(ctx, resp)), transmittedValue}}, nil
 }
 
 func (h *pluginHost) responseGetStatusCode(_ context.Context, args []component.Value) ([]component.Value, error) {
@@ -833,26 +909,26 @@ func (h *pluginHost) responseSetStatusCode(_ context.Context, args []component.V
 	return results(nil, nil), nil
 }
 
-func (h *pluginHost) responseGetHeaders(_ context.Context, args []component.Value) ([]component.Value, error) {
+func (h *pluginHost) responseGetHeaders(ctx context.Context, args []component.Value) ([]component.Value, error) {
 	resp, err := getObject[*httpResponse](h, args[0].(uint32))
 	if err != nil {
 		return nil, err
 	}
 
-	return []component.Value{h.add(&httpFields{entries: resp.headers.entries, immutable: true})}, nil
+	return []component.Value{h.add(ctx, &httpFields{entries: resp.headers.entries, immutable: true})}, nil
 }
 
-func (h *pluginHost) responseConsumeBody(_ context.Context, args []component.Value) ([]component.Value, error) {
+func (h *pluginHost) responseConsumeBody(ctx context.Context, args []component.Value) ([]component.Value, error) {
 	resp, err := takeObject[*httpResponse](h, args[0].(uint32))
 	if err != nil {
 		return nil, fmt.Errorf("response.consume-body: %w", err)
 	}
 
-	return h.consumeBody(resp.body, args[1])
+	return h.consumeBody(ctx, resp.body, args[1])
 }
 
 // consumeBody hands body over to the guest as a stream and a trailers future.
-func (h *pluginHost) consumeBody(body *httpBody, res component.Value) ([]component.Value, error) {
+func (h *pluginHost) consumeBody(ctx context.Context, body *httpBody, res component.Value) ([]component.Value, error) {
 	// The host has no error to report on the guest's side of the exchange.
 	if f, ok := res.(*component.FutureReader); ok {
 		f.Close()
@@ -878,86 +954,92 @@ func (h *pluginHost) consumeBody(body *httpBody, res component.Value) ([]compone
 	}
 
 	reader := body.reader
-	h.call.cleanups = append(h.call.cleanups, func() { _ = reader.Close() })
+	call := callFrom(ctx)
 
-	feeder := &streamFeeder{
-		writer: writer,
-		src:    reader,
-		done: func(err error) {
-			_ = reader.Close()
+	feeder := newStreamFeeder(h.loop, writer, reader, func(err error) {
+		// Closing a request body waits for a read in progress.
+		go func() { _ = reader.Close() }()
 
-			if errors.Is(err, errStreamDropped) {
-				trailers.Set(result(nil, internalError("body dropped")), closeFuture(trailers))
-				return
+		if errors.Is(err, errStreamDropped) {
+			trailers.Set(result(nil, internalError("body dropped")), closeFuture(trailers))
+			return
+		}
+		if err != nil {
+			trailers.Set(result(nil, internalError(err.Error())), closeFuture(trailers))
+			return
+		}
+
+		var value component.Value
+		if body.trailers != nil {
+			if t := body.trailers(); len(t) > 0 {
+				value = h.add(ctx, newFieldsFromHeader(t, false))
 			}
-			if err != nil {
-				trailers.Set(result(nil, internalError(err.Error())), closeFuture(trailers))
-				return
-			}
+		}
 
-			var value component.Value
-			if body.trailers != nil {
-				if t := body.trailers(); len(t) > 0 {
-					value = h.add(newFieldsFromHeader(t, false))
-				}
-			}
-
-			trailers.Set(result(value, nil), closeFuture(trailers))
-		},
-	}
-	h.call.cleanups = append(h.call.cleanups, feeder.cancel)
-	feeder.run()
+		trailers.Set(result(value, nil), closeFuture(trailers))
+	})
+	call.onCleanup(feeder.cancel)
+	feeder.start()
 
 	return []component.Value{[]component.Value{streamValue, trailersValue}}, nil
 }
 
 // handle is the imported wasi:http/handler.handle: it forwards the request to
 // the next handler, and resolves with its response once it wrote the headers.
-func (h *pluginHost) handle(_ context.Context, args []component.Value, call *component.AsyncCall) error {
+func (h *pluginHost) handle(ctx context.Context, args []component.Value, asyncCall *component.AsyncCall) error {
+	call := callFrom(ctx)
+	if call == nil {
+		return errors.New("handler.handle: no request to forward outside a request")
+	}
+
 	req, err := takeObject[*httpRequest](h, args[0].(uint32))
 	if err != nil {
 		return fmt.Errorf("handler.handle: %w", err)
 	}
 
-	out, err := h.outgoingRequest(req)
+	out, err := h.outgoingRequest(call, req)
 	if err != nil {
-		h.call.logger.Debug().Err(err).Msg("Rejecting the request forwarded by the plugin")
+		call.logger.Debug().Err(err).Msg("Rejecting the request forwarded by the plugin")
 
-		call.Resolve([]component.Value{result(nil, component.VariantValue{Disc: errorCodeHTTPRequestDenied})})
+		asyncCall.Resolve([]component.Value{result(nil, component.VariantValue{Disc: errorCodeHTTPRequestDenied})})
 		return nil
 	}
 
 	resp := &httpResponse{}
-	respRep := h.add(resp)
+	respRep := h.add(ctx, resp)
 
 	// The next handler resolves the call from its own goroutine, which
 	// AsyncCall only accepts once handle returned.
-	call.Defer(func() { h.forward(out, req, resp, respRep, call) })
+	asyncCall.Defer(func() { h.forward(call, out, req, resp, respRep, asyncCall) })
 
 	return nil
 }
 
-// forward runs the next handler on its own goroutine, and feeds it the body
-// the guest produced.
-func (h *pluginHost) forward(out *http.Request, req *httpRequest, resp *httpResponse, respRep uint32, call *component.AsyncCall) {
-	var bodyWriter *io.PipeWriter
+// forward runs the next handler on its own goroutine, with the body the guest
+// produced.
+func (h *pluginHost) forward(call *wasmCall, out *http.Request, req *httpRequest, resp *httpResponse, respRep uint32, asyncCall *component.AsyncCall) {
 	if req.body.stream != nil {
-		var bodyReader *io.PipeReader
-		bodyReader, bodyWriter = io.Pipe()
-		out.Body = bodyReader
+		body := newStreamBody(h.loop, req.body.stream, req.body.trailersFuture, h.readTrailers, func(err error) {
+			setTransmitted(req.transmitted, err)
+		})
+		call.onCleanup(func() { body.end(nil, errBodyCanceled, true) })
+
+		out.Body = &requestBody{streamBody: body, trailer: out.Trailer}
+	} else {
+		setTransmitted(req.transmitted, nil)
 	}
 
-	resolver := h.call.resolver
+	resolver := call.resolver
 	rw := newNextResponseWriter(func(status int, header http.Header, body io.ReadCloser, trailers func() http.Header) {
 		resp.status = status
 		resp.headers = newFieldsFromHeader(header, true)
 		resp.body = &httpBody{reader: body, trailers: trailers}
 
-		resolver.resolve(call, []component.Value{result(component.OwnedRep(respRep), nil)})
+		resolver.resolve(asyncCall, []component.Value{result(component.OwnedRep(respRep), nil)})
 	})
-	h.call.cleanups = append(h.call.cleanups, rw.abort)
+	call.onRelease(rw.abort)
 
-	next, logger := h.call.next, h.call.logger
+	next, logger := call.next, call.logger
 	go func() {
 		defer func() {
 			if err := recover(); err != nil {
@@ -975,40 +1057,30 @@ func (h *pluginHost) forward(out *http.Request, req *httpRequest, resp *httpResp
 			_ = out.Body.Close()
 		}
 	}()
+}
 
-	if bodyWriter == nil {
-		setTransmitted(req.transmitted, nil)
-		return
+// requestBody is a guest body the next handler reads: it fills the request
+// trailers before it reports io.EOF, as net/http expects.
+type requestBody struct {
+	*streamBody
+
+	trailer http.Header
+}
+
+func (b *requestBody) Read(p []byte) (int, error) {
+	n, err := b.streamBody.Read(p)
+	if errors.Is(err, io.EOF) {
+		maps.Copy(b.trailer, b.Trailers())
 	}
 
-	drainer := &streamDrainer{
-		reader: req.body.stream,
-		dst:    bodyWriter,
-		done: func(err error) {
-			if err != nil {
-				_ = bodyWriter.CloseWithError(err)
-				setTransmitted(req.transmitted, err)
-
-				return
-			}
-
-			h.readTrailers(req.body.trailersFuture, func(trailers http.Header, err error) {
-				maps.Copy(out.Trailer, trailers)
-
-				_ = bodyWriter.CloseWithError(err)
-				setTransmitted(req.transmitted, err)
-			})
-		},
-	}
-	h.call.cleanups = append(h.call.cleanups, drainer.cancel)
-	drainer.run()
+	return n, err
 }
 
 // outgoingRequest builds the request the next handler receives. It starts
 // from the incoming request, so that the next handler keeps its context,
 // connection details and TLS state.
-func (h *pluginHost) outgoingRequest(req *httpRequest) (*http.Request, error) {
-	out := h.call.incoming.Clone(h.call.ctx)
+func (h *pluginHost) outgoingRequest(call *wasmCall, req *httpRequest) (*http.Request, error) {
+	out := call.incoming.Clone(call.ctx)
 
 	out.Method = req.method
 	out.Header = req.headers.header()
@@ -1046,7 +1118,7 @@ func (h *pluginHost) outgoingRequest(req *httpRequest) (*http.Request, error) {
 
 		if req.body.reader == http.NoBody {
 			out.ContentLength = 0
-		} else if out.Body != h.call.incoming.Body {
+		} else if out.Body != call.incoming.Body {
 			out.ContentLength = contentLength(out.Header)
 		}
 	}
@@ -1125,40 +1197,18 @@ func (h *pluginHost) takeResponse(v component.Value) (*httpResponse, error) {
 }
 
 // streamResponseBody turns a body the guest writes into one net/http reads.
-// The guest writes the body after it returned the response. The returned
-// start function reads the body, and must only run once something reads
-// body.reader, because the first chunk can already be in the stream.
-func (h *pluginHost) streamResponseBody(body *httpBody) (start func()) {
+// The guest writes it after it returned the response.
+func (h *pluginHost) streamResponseBody(call *wasmCall, body *httpBody) {
 	if body.stream == nil {
-		return func() {}
+		return
 	}
 
-	pr, pw := io.Pipe()
-	var trailers http.Header
+	stream := newStreamBody(h.loop, body.stream, body.trailersFuture, h.readTrailers, func(error) {})
+	call.onCleanup(func() { stream.end(nil, errBodyCanceled, true) })
 
-	stream, trailersFuture := body.stream, body.trailersFuture
 	body.stream, body.trailersFuture = nil, nil
-	body.reader = pr
-	body.trailers = func() http.Header { return trailers }
-
-	drainer := &streamDrainer{
-		reader: stream,
-		dst:    pw,
-		done: func(err error) {
-			if err != nil {
-				_ = pw.CloseWithError(err)
-				return
-			}
-
-			h.readTrailers(trailersFuture, func(t http.Header, err error) {
-				trailers = t
-				_ = pw.CloseWithError(err)
-			})
-		},
-	}
-	h.call.cleanups = append(h.call.cleanups, drainer.cancel)
-
-	return drainer.run
+	body.reader = stream
+	body.trailers = stream.Trailers
 }
 
 func setTransmitted(f *component.FutureWriter, err error) {
