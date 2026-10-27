@@ -421,4 +421,4 @@ replace (
 // tencentcloud uses monorepo with multimodule but the go.mod files are incomplete.
 exclude github.com/tencentcloud/tencentcloud-sdk-go v3.0.83+incompatible
 
-replace github.com/samyfodil/wazy => ../wazy
+replace github.com/samyfodil/wazy => github.com/jspdown/wazy v0.0.0-20261027160622-5163764d0714
