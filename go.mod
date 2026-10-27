@@ -35,7 +35,6 @@ require (
 	github.com/hashicorp/go-retryablehttp v0.7.8
 	github.com/hashicorp/go-version v1.9.0
 	github.com/hashicorp/nomad/api v0.0.0-20231213195942-64e3dca9274b // No tag on the repo.
-	github.com/http-wasm/http-wasm-host-go v0.7.0
 	github.com/huandu/xstrings v1.5.0
 	github.com/influxdata/influxdb-client-go/v2 v2.7.0
 	github.com/influxdata/influxdb1-client v0.0.0-20200827194710-b269163b24ab // No tag on the repo.
@@ -62,16 +61,14 @@ require (
 	github.com/redis/go-redis/v9 v9.21.0
 	github.com/rs/zerolog v1.34.0
 	github.com/samber/slog-zerolog/v2 v2.9.2
+	github.com/samyfodil/wazy v0.5.0
 	github.com/sirupsen/logrus v1.10.2
 	github.com/spiffe/go-spiffe/v2 v2.8.1
-	github.com/stealthrocket/wasi-go v0.8.0
-	github.com/stealthrocket/wazergo v0.19.1
 	github.com/stretchr/testify v1.12.1
 	github.com/stvp/go-udp-testing v0.0.0-20201019212854-469649b16807 // No tag on the repo.
 	github.com/tailscale/tscert v0.0.0-20230806124524-28a91b69a046 // No tag on the repo.
 	github.com/testcontainers/testcontainers-go v0.42.0
 	github.com/testcontainers/testcontainers-go/modules/k3s v0.42.0
-	github.com/tetratelabs/wazero v1.8.0
 	github.com/tidwall/gjson v1.17.0
 	github.com/traefik/grpc-web v0.18.0
 	github.com/traefik/paerser v0.2.2
@@ -423,3 +420,5 @@ replace (
 // ambiguous import: found package github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/http in multiple modules
 // tencentcloud uses monorepo with multimodule but the go.mod files are incomplete.
 exclude github.com/tencentcloud/tencentcloud-sdk-go v3.0.83+incompatible
+
+replace github.com/samyfodil/wazy => ../wazy

@@ -1,0 +1,17 @@
+[package]
+name = "wasihttp"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = { version = "0.62.0", default-features = false, features = ["async-spawn", "macros", "realloc", "std"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

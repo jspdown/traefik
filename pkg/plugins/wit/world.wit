@@ -1,0 +1,13 @@
+package traefik:plugin@0.1.0;
+
+/// The world a Traefik middleware plugin component targets.
+///
+/// Traefik calls the exported `wasi:http/handler` for each request. The
+/// imported `wasi:http/handler` forwards a request to the next handler of the
+/// router chain. `wasi:config/store` holds the middleware configuration: each
+/// top-level option is one key, a string value as is, any other value JSON
+/// encoded.
+world middleware {
+  include wasi:http/middleware@0.3.0;
+  import wasi:config/store@0.2.0-rc.1;
+}

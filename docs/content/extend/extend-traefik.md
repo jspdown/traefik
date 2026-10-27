@@ -39,15 +39,33 @@ This approach eliminates the need for compilation and a complex toolchain, makin
 
 ### WebAssembly (WASM) Plugin System
 
-Traefik WASM plugins can be developed using any language that compiles to WebAssembly (WASM). This method is based on [http-wasm](https://http-wasm.io/).
+A Traefik WASM plugin is a [WebAssembly component](https://component-model.bytecodealliance.org/) that implements the [`wasi:http/middleware`](https://github.com/WebAssembly/WASI/tree/main/proposals/http) world of WASI 0.3. You can write it in any language with a toolchain for WASI 0.3 components, such as Rust with [`wit-bindgen`](https://github.com/bytecodealliance/wit-bindgen).
 
-WASM plugins compile to portable binary modules that execute with near-native performance while maintaining security isolation.
+Traefik calls the exported `wasi:http/handler` interface for each request. The plugin forwards a request to the next handler of the router with the imported `wasi:http/handler` interface, or answers the request itself. Requests, responses and their bodies are WASI 0.3 resources and streams, so a plugin can change a body while it flows.
+
+The plugin reads its routing configuration through the `wasi:config/store` interface. Each top-level option of the middleware configuration is one key. A string value is given as is, and any other value is JSON encoded.
+
+The plugin targets the `traefik:plugin/middleware` world:
+
+```wit
+package traefik:plugin@0.1.0;
+
+world middleware {
+  include wasi:http/middleware@0.3.0;
+  import wasi:config/store@0.2.0-rc.1;
+}
+```
+
+A component built for the `wasm32-wasip2` target can also use the WASI 0.2 interfaces of its standard library. The `settings.envs` and `settings.mounts` plugin options give it environment variables and directories.
+
+!!! warning "http-wasm plugins"
+    Traefik does not run [http-wasm](https://http-wasm.io/) plugins anymore. A WASM plugin must be a component that implements the world above.
 
 #### Key characteristics
 
-- Multi-language support (Go, Rust, C++, etc.)
-- Compiled to WebAssembly binary
-- Near-native performance
+- Multi-language support (Rust, C, Go, JavaScript, etc.)
+- Compiled to a WebAssembly component
+- Standard WASI 0.3 HTTP interfaces, with streamed bodies
 - Strong security isolation
 - Currently supports middleware only
 
