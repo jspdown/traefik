@@ -976,7 +976,7 @@ func (p *Provider) buildListenerRouters(gateways []gatewayWithListeners, fronten
 			listenerRouter := &dynamic.Router{
 				Rule:        buildListenerRule(hostname, hostnames),
 				EntryPoints: []string{uniq.epName},
-				Metadata:    k8s.NewMetadata(),
+				Metadata:    &dynamic.Metadata{Kubernetes: &dynamic.KubernetesMetadata{}},
 			}
 
 			var validation *tls.ClientAuth
@@ -1652,7 +1652,7 @@ type backendAddress struct {
 	Port int32
 }
 
-func (p *Provider) getBackendAddresses(namespace string, ref gatev1.BackendRef) ([]backendAddress, corev1.ServicePort, []dynamic.KubernetesRef, error) {
+func (p *Provider) getBackendAddresses(namespace string, ref gatev1.BackendRef) ([]backendAddress, corev1.ServicePort, *dynamic.ServiceMetadata, error) {
 	if ref.Port == nil {
 		return nil, corev1.ServicePort{}, nil, errors.New("port is required for Kubernetes Service reference")
 	}
@@ -1666,14 +1666,15 @@ func (p *Provider) getBackendAddresses(namespace string, ref gatev1.BackendRef) 
 	}
 
 	var svcPort *corev1.ServicePort
-	var serviceSources []dynamic.KubernetesRef
+	var metadata *dynamic.ServiceMetadata
 	for i, p := range service.Spec.Ports {
 		if p.Port == *ref.Port {
 			svcPort = &p
-			serviceSources = []dynamic.KubernetesRef{
+			metadata = k8s.NewServiceMetadata(
 				dynamic.MakeKubernetesRef(service, "/metadata/annotations"),
 				dynamic.MakeKubernetesRef(service, fmt.Sprintf("/spec/ports/%d", i)),
-			}
+			)
+			metadata.Kubernetes.ServicePort = strconv.Itoa(int(p.Port))
 			break
 		}
 	}
@@ -1699,7 +1700,7 @@ func (p *Provider) getBackendAddresses(namespace string, ref gatev1.BackendRef) 
 		return []backendAddress{{
 			IP:   service.Spec.ClusterIP,
 			Port: svcPort.Port,
-		}}, *svcPort, serviceSources, nil
+		}}, *svcPort, metadata, nil
 	}
 
 	endpointSlices, err := p.k8sClient.ListEndpointSlicesForService(namespace, string(ref.Name))
@@ -1743,7 +1744,7 @@ func (p *Provider) getBackendAddresses(namespace string, ref gatev1.BackendRef) 
 		}
 	}
 
-	return backendServers, *svcPort, serviceSources, nil
+	return backendServers, *svcPort, metadata, nil
 }
 
 // hasInsecureFrontendValidationMode reports whether a validation of the Gateway allows an insecure fallback.
